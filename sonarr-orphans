@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""Report untracked videos and video-less sidecars in a Sonarr library.
+
+Example:
+  sonarr-orphans --api-key KEY
+
+The scanner only sends GET requests and only writes the requested CSV report.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import sys
+import time
+import unicodedata
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urlsplit
+from urllib.request import Request, urlopen
+
+VIDEO_EXTENSIONS = frozenset({".mkv", ".mp4", ".m4v", ".avi", ".ts", ".mov", ".wmv", ".mpg", ".mpeg", ".webm"})
+SIDECAR_EXTENSIONS = frozenset({".nfo", ".srt"})
+SUBTITLE_FLAGS = frozenset({"forced", "sdh", "cc", "hi", "hearingimpaired", "hearing-impaired", "default"})
+LANGUAGE_TAG = re.compile(r"(?:[a-z]{2}(?:-[a-z0-9]{2,8})*|eng|nld|dut|fra|fre|deu|ger|spa|ita|por|jpn|zho|chi|kor|rus)", re.IGNORECASE)
+CSV_COLUMNS = ("Status", "Type", "Series", "Relative Path", "Absolute Path", "Size Bytes", "Size", "Reason", "Matching Video")
+
+
+class ScanError(Exception):
+    """A condition that would make the report incomplete or unreliable."""
+
+
+class Progress:
+    """Reuse one terminal line; emit occasional plain lines when redirected."""
+
+    def __init__(self) -> None:
+        self.stream = sys.stdout
+        self.interactive = self.stream.isatty()
+        self.last_update = 0.0
+        self.active = False
+
+    def update(self, message: str, *, force: bool = False) -> None:
+        now = time.monotonic()
+        interval = 0.2 if self.interactive else 5.0
+        if not force and now - self.last_update < interval:
+            return
+        if self.interactive:
+            print(f"\r\033[2K{message}", end="", file=self.stream, flush=True)
+        else:
+            print(message, file=self.stream, flush=True)
+        self.last_update = now
+        self.active = True
+
+    def clear(self) -> None:
+        if self.interactive and self.active:
+            print("\r\033[2K", end="", file=self.stream, flush=True)
+        self.active = False
+
+
+@dataclass(frozen=True)
+class Finding:
+    status: str
+    file_type: str
+    series: str
+    path: Path
+    size_bytes: int
+    reason: str
+    matching_video: bool | None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--sonarr-url", default="https://sonarr.local.qrivi.dev", help="Sonarr base URL (default: https://sonarr.local.qrivi.dev)")
+    parser.add_argument("--api-key", required=True, help="Sonarr API key")
+    parser.add_argument("--sonarr-root", type=Path, default=Path("/data/Shows"), help="library root as seen by Sonarr (default: /data/Shows)")
+    parser.add_argument("--local-root", type=Path, default=Path("/Volumes/media/Shows"), help="same library root as seen by this computer (default: /Volumes/media/Shows)")
+    parser.add_argument("--output", type=Path, default=Path("sonarr-orphans.csv"), help="CSV report path (default: sonarr-orphans.csv)")
+    return parser.parse_args()
+
+
+def normalized(path: Path) -> Path:
+    """Normalize syntax without resolving links or changing path case."""
+    return Path(os.path.abspath(os.path.normpath(os.fspath(path))))
+
+
+def validate_roots(sonarr_root: Path, local_root: Path) -> None:
+    if not sonarr_root.is_absolute():
+        raise ScanError(f"Sonarr root {sonarr_root} must be an absolute path")
+    if not local_root.is_dir():
+        raise ScanError(f"local root {local_root} does not exist or is not a directory. Is the SMB share mounted?")
+    if sys.platform == "darwin":
+        parts = local_root.parts
+        if len(parts) >= 3 and parts[1] == "Volumes":
+            share = Path(parts[0], parts[1], parts[2])
+            if not os.path.ismount(share):
+                raise ScanError(f"SMB share {share} is not mounted")
+
+
+def map_sonarr_path_to_local(path: object, sonarr_root: Path, local_root: Path) -> Path:
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise ScanError(f"Sonarr returned a missing or non-absolute path: {path!r}")
+    original = normalized(Path(path))
+    try:
+        relative = original.relative_to(sonarr_root)
+    except ValueError as exc:
+        raise ScanError(f"Sonarr path {original} is outside --sonarr-root {sonarr_root}") from exc
+    return normalized(local_root / relative)
+
+
+def api_get(base_url: str, api_key: str, endpoint: str, params: dict[str, int] | None = None) -> list[dict[str, object]]:
+    url = base_url.rstrip("/") + "/api/v3/" + endpoint
+    if params:
+        url += "?" + urlencode(params)
+    request = Request(url, headers={"X-Api-Key": api_key, "Accept": "application/json"}, method="GET")
+    try:
+        with urlopen(request, timeout=30) as response:
+            data = json.load(response)
+    except HTTPError as exc:
+        if exc.code in (401, 403):
+            raise ScanError(f"Sonarr authentication failed (HTTP {exc.code}); check --api-key") from exc
+        raise ScanError(f"Sonarr request {endpoint} failed (HTTP {exc.code})") from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise ScanError(f"cannot reach Sonarr at {base_url}: {exc}") from exc
+    except (ValueError, UnicodeError) as exc:
+        raise ScanError(f"Sonarr returned invalid JSON for {endpoint}: {exc}") from exc
+    if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+        raise ScanError(f"Sonarr returned an unexpected response for {endpoint}")
+    return data
+
+
+def get_tracked_episode_files(base_url: str, api_key: str, sonarr_root: Path, local_root: Path, progress: Progress | None = None) -> tuple[set[Path], list[tuple[Path, str]]]:
+    tracked: set[Path] = set()
+    series_paths: list[tuple[Path, str]] = []
+    if progress:
+        progress.update("Fetching Sonarr series...", force=True)
+    series_list = api_get(base_url, api_key, "series")
+    for index, series in enumerate(series_list, start=1):
+        if progress:
+            progress.update(f"Fetching Sonarr episode files: series {index:,}/{len(series_list):,}", force=index == 1)
+        series_id = series.get("id")
+        if not isinstance(series_id, int):
+            raise ScanError(f"Sonarr series has no valid id: {series!r}")
+        series_path = map_sonarr_path_to_local(series.get("path"), sonarr_root, local_root)
+        series_paths.append((series_path, str(series.get("title") or series_path.name)))
+        files = api_get(base_url, api_key, "episodefile", {"seriesId": series_id})
+        for episode_file in files:
+            tracked.add(map_sonarr_path_to_local(episode_file.get("path"), sonarr_root, local_root))
+    series_paths.sort(key=lambda pair: len(pair[0].parts), reverse=True)
+    return tracked, series_paths
+
+
+def series_for(path: Path, local_root: Path, series_paths: list[tuple[Path, str]]) -> str:
+    for series_path, title in series_paths:
+        if path.is_relative_to(series_path):
+            return title
+    relative = path.relative_to(local_root)
+    return relative.parts[0] if len(relative.parts) > 1 else ""
+
+
+def subtitle_bases(stem: str) -> list[str]:
+    """Try the literal stem first, then remove recognized trailing subtitle tags."""
+    bases = [stem]
+    current = stem
+    while "." in current:
+        base, suffix = current.rsplit(".", 1)
+        if not base or not (suffix.casefold() in SUBTITLE_FLAGS or LANGUAGE_TAG.fullmatch(suffix)):
+            break
+        bases.append(base)
+        current = base
+    return bases
+
+
+def scan_library(local_root: Path, tracked: set[Path], series_paths: list[tuple[Path, str]], progress: Progress | None = None) -> tuple[list[Finding], int, int, int]:
+    videos: set[tuple[Path, str]] = set()
+    sidecars: list[tuple[Path, int]] = []
+    orphan_videos: list[Finding] = []
+    scanned = 0
+    if progress:
+        progress.update("Scanning library: 0 files", force=True)
+    mac_candidates: dict[str, list[Path]] = {}
+    if sys.platform == "darwin":
+        for candidate in tracked:
+            key = unicodedata.normalize("NFD", str(candidate)).casefold()
+            mac_candidates.setdefault(key, []).append(candidate)
+
+    def walk_error(error: OSError) -> None:
+        raise ScanError(f"cannot scan library: {error}")
+
+    for directory, _, filenames in os.walk(local_root, onerror=walk_error):
+        parent = Path(directory)
+        for filename in filenames:
+            scanned += 1
+            if progress and scanned % 100 == 0:
+                progress.update(f"Scanning library: {scanned:,} files")
+            path = parent / filename
+            extension = path.suffix.casefold()
+            if extension not in VIDEO_EXTENSIONS and extension not in SIDECAR_EXTENSIONS:
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError as exc:
+                raise ScanError(f"cannot read {path}: {exc}") from exc
+            if extension in VIDEO_EXTENSIONS:
+                videos.add((parent, path.stem))
+                # A case-insensitive macOS volume may resolve a Sonarr path whose
+                # spelling differs from the directory entry. Check those rare
+                # mismatches against the filesystem without folding every path.
+                tracked_on_disk = path in tracked
+                if not tracked_on_disk and sys.platform == "darwin":
+                    key = unicodedata.normalize("NFD", str(path)).casefold()
+                    for candidate in mac_candidates.get(key, ()):
+                        try:
+                            if os.path.samefile(path, candidate):
+                                tracked_on_disk = True
+                                break
+                        except OSError:
+                            pass
+                if not tracked_on_disk:
+                    orphan_videos.append(Finding("ORPHAN_VIDEO", "video", series_for(path, local_root, series_paths), path, size,
+                                                 "Video exists but is not tracked by Sonarr", None))
+            else:
+                sidecars.append((path, size))
+
+    if progress:
+        progress.update(f"Checking sidecars: {len(sidecars):,} files", force=True)
+    findings = orphan_videos[:]
+    for path, size in sidecars:
+        bases = subtitle_bases(path.stem) if path.suffix.casefold() == ".srt" else [path.stem]
+        if not any((path.parent, base) in videos for base in bases):
+            findings.append(Finding("ORPHAN_SIDECAR", "subtitle" if path.suffix.casefold() == ".srt" else "nfo",
+                                    series_for(path, local_root, series_paths), path, size,
+                                    "No matching video exists in the same directory", False))
+    findings.sort(key=lambda item: str(item.path))
+    return findings, scanned, len(orphan_videos), len(findings) - len(orphan_videos)
+
+
+def format_size(size_bytes: int) -> str:
+    for unit, divisor in (("GB", 1024**3), ("MB", 1024**2)):
+        if size_bytes >= divisor:
+            return f"{size_bytes / divisor:.2f} {unit}"
+    return f"{size_bytes / 1024:.2f} KB"
+
+
+def write_csv(output: Path, local_root: Path, findings: list[Finding]) -> None:
+    try:
+        with output.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(CSV_COLUMNS)
+            for finding in findings:
+                writer.writerow((finding.status, finding.file_type, finding.series,
+                                 finding.path.relative_to(local_root).as_posix(), str(finding.path),
+                                 finding.size_bytes, format_size(finding.size_bytes), finding.reason,
+                                 "" if finding.matching_video is None else str(finding.matching_video).lower()))
+    except OSError as exc:
+        raise ScanError(f"cannot write CSV {output}: {exc}") from exc
+
+
+def main() -> int:
+    args = parse_args()
+    progress = Progress()
+    try:
+        url = urlsplit(args.sonarr_url)
+        if url.scheme not in ("http", "https") or not url.netloc or url.query or url.fragment:
+            raise ScanError("--sonarr-url must be an HTTP(S) base URL without query or fragment")
+        sonarr_root = normalized(args.sonarr_root)
+        local_root = normalized(args.local_root)
+        validate_roots(args.sonarr_root, local_root)
+        tracked, series_paths = get_tracked_episode_files(args.sonarr_url, args.api_key, sonarr_root, local_root, progress)
+        findings, scanned, orphan_video_count, orphan_sidecar_count = scan_library(local_root, tracked, series_paths, progress)
+        progress.update("Writing CSV report...", force=True)
+        write_csv(args.output, local_root, findings)
+    except ScanError as exc:
+        progress.clear()
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        progress.clear()
+        print("Scan cancelled.", file=sys.stderr)
+        return 130
+    finally:
+        progress.clear()
+    print(f"Scanned: {scanned:,} files")
+    print(f"Tracked Sonarr videos: {len(tracked):,}")
+    print(f"Orphan videos: {orphan_video_count:,}")
+    print(f"Orphan sidecars: {orphan_sidecar_count:,}")
+    print(f"Potential orphan video size: {sum(f.size_bytes for f in findings if f.status == 'ORPHAN_VIDEO') / 1024**3:.2f} GB")
+    print(f"\nCSV written to:\n{args.output}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
