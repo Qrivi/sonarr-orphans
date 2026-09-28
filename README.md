@@ -9,3 +9,11 @@ I suspect these are edge cases: Tdarr may finish transcoding a file after Sonarr
 - Lists video files that are not tracked by Sonarr
 
 ![Example output](.github/screenshot.png)
+
+Run the offline regression tests with Python's built-in test runner:
+
+```sh
+python3 -B -m unittest -v
+```
+
+The tests use temporary library folders and mocked Sonarr responses; they do not require an API key or a mounted media share.

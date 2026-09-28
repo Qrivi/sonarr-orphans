@@ -183,10 +183,12 @@ def scan_library(local_root: Path, tracked: set[Path], series_paths: list[tuple[
     if progress:
         progress.update("Scanning library: 0 files", force=True)
     mac_candidates: dict[str, list[Path]] = {}
+    mac_unicode_paths: set[str] = set()
     if sys.platform == "darwin":
         for candidate in tracked:
-            key = unicodedata.normalize("NFD", str(candidate)).casefold()
-            mac_candidates.setdefault(key, []).append(candidate)
+            unicode_path = unicodedata.normalize("NFD", str(candidate))
+            mac_unicode_paths.add(unicode_path)
+            mac_candidates.setdefault(unicode_path.casefold(), []).append(candidate)
 
     def walk_error(error: OSError) -> None:
         raise ScanError(f"cannot scan library: {error}")
@@ -209,19 +211,23 @@ def scan_library(local_root: Path, tracked: set[Path], series_paths: list[tuple[
                 raise ScanError(f"cannot read {path}: {exc}") from exc
             if extension in VIDEO_EXTENSIONS:
                 videos.add((parent, path.stem))
-                # A case-insensitive macOS volume may resolve a Sonarr path whose
-                # spelling differs from the directory entry. Check those rare
-                # mismatches against the filesystem without folding every path.
+                # SMB directory entries on macOS can use decomposed accents while
+                # Sonarr uses composed accents. The Sonarr spelling may not even
+                # resolve on the mount, so samefile cannot establish equivalence.
+                # Compare canonical Unicode spellings before checking case-only
+                # differences against the filesystem.
                 tracked_on_disk = path in tracked
                 if not tracked_on_disk and sys.platform == "darwin":
-                    key = unicodedata.normalize("NFD", str(path)).casefold()
-                    for candidate in mac_candidates.get(key, ()):
-                        try:
-                            if os.path.samefile(path, candidate):
-                                tracked_on_disk = True
-                                break
-                        except OSError:
-                            pass
+                    unicode_path = unicodedata.normalize("NFD", str(path))
+                    tracked_on_disk = unicode_path in mac_unicode_paths
+                    if not tracked_on_disk:
+                        for candidate in mac_candidates.get(unicode_path.casefold(), ()):
+                            try:
+                                if os.path.samefile(path, candidate):
+                                    tracked_on_disk = True
+                                    break
+                            except OSError:
+                                pass
                 if not tracked_on_disk:
                     orphan_videos.append(Finding("ORPHAN_VIDEO", "video", series_for(path, local_root, series_paths), path, size,
                                                  "Video exists but is not tracked by Sonarr", None))
